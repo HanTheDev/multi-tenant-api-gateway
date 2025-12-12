@@ -1,0 +1,25 @@
+.env
+
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# IDE/Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Go-specific (optional)
+vendor/  # if you vendor dependencies
+coverage.txt
+profile.out
