@@ -5,6 +5,7 @@ import (
 	"log"
 	"net/http"
 
+	"github.com/HanTheDev/multi-tenant-api-gateway/internal/admin"
 	"github.com/HanTheDev/multi-tenant-api-gateway/internal/auth"
 	"github.com/HanTheDev/multi-tenant-api-gateway/internal/cache"
 	"github.com/HanTheDev/multi-tenant-api-gateway/internal/config"
@@ -51,16 +52,20 @@ func main() {
 	router.HandleFunc("/health", healthHandler).Methods("GET")
 	router.HandleFunc("/auth/token", tokenHandler(database, cfg.JWTSecret)).Methods("POST")
 
-	// Protected routes - NOW PASSING semanticCache
-	proxyHandler := proxy.NewHandler(database, limiter, semanticCache)
+	// Admin routes (you may want to add admin auth middleware here)
+	adminHandler := admin.NewAdminHandler(database)
+	adminHandler.RegisterRoutes(router)
 
-	// Apply auth middleware to proxy routes
+	// Protected proxy routes
+	proxyHandler := proxy.NewHandler(database, limiter, semanticCache)
 	router.PathPrefix("/api/").Handler(
 		authMiddleware.Authenticate(proxyHandler),
 	)
 
 	// Start server
 	log.Printf("Server starting on port %s", cfg.ServerPort)
+	log.Printf("Admin API available at /admin/*")
+	log.Printf("Proxy API available at /api/*")
 	if err := http.ListenAndServe(":"+cfg.ServerPort, router); err != nil {
 		log.Fatal("Server failed:", err)
 	}
@@ -68,7 +73,10 @@ func main() {
 
 func healthHandler(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
-	w.Write([]byte("OK"))
+	json.NewEncoder(w).Encode(map[string]string{
+		"status":  "healthy",
+		"version": "1.0.0",
+	})
 }
 
 func tokenHandler(database *db.DB, jwtSecret string) http.HandlerFunc {
