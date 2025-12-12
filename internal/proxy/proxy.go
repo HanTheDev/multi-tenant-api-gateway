@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"log"
@@ -42,8 +43,6 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Printf("Request from tenant ID: %d, API Key: %s", claims.TenantID, claims.APIKey)
-
 	// Get tenant info
 	tenant, err := h.db.GetTenantByAPIKey(r.Context(), claims.APIKey)
 	if err != nil {
@@ -51,8 +50,6 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Tenant not found", http.StatusNotFound)
 		return
 	}
-
-	log.Printf("Tenant found: %s (ID: %d, Backend: %s)", tenant.Name, tenant.ID, tenant.BackendURL)
 
 	// Check rate limit
 	allowed, err := h.rateLimiter.Allow(r.Context(), tenant.ID, tenant.RateLimitPerHour)
@@ -68,7 +65,39 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Printf("Rate limit OK for tenant: %d", tenant.ID)
+	// Read request body once and cache it
+	var bodyBytes []byte
+	if r.Body != nil {
+		bodyBytes, err = io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, "Failed to read request body", http.StatusBadRequest)
+			return
+		}
+		r.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
+	}
+
+	// Try semantic cache for LLM requests
+	if h.isLLMRequest(r) && len(bodyBytes) > 0 {
+		prompt := h.extractPromptFromBody(bodyBytes)
+		if prompt != "" {
+			cachedResponse, hit, err := h.semanticCache.GetCachedResponse(r.Context(), tenant.ID, prompt)
+			if err == nil && hit {
+				log.Printf("✅ Cache HIT for tenant %d", tenant.ID)
+
+				// Write cached response
+				w.Header().Set("Content-Type", "application/json")
+				w.Header().Set("X-Cache-Status", "HIT")
+				w.WriteHeader(http.StatusOK)
+				w.Write([]byte(cachedResponse))
+
+				// Log access with cache hit
+				elapsed := time.Since(startTime)
+				h.logAccess(r.Context(), tenant.ID, r.URL.Path, r.Method, http.StatusOK, elapsed, r.ContentLength, int64(len(cachedResponse)))
+				return
+			}
+			log.Printf("Cache MISS for tenant %d", tenant.ID)
+		}
+	}
 
 	// Parse backend URL
 	backendURL, err := url.Parse(tenant.BackendURL)
@@ -78,62 +107,65 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Printf("Parsed backend URL: %s", backendURL.String())
-
-	// Create reverse proxy
+	// Create reverse proxy with timeout
 	proxy := httputil.NewSingleHostReverseProxy(backendURL)
 
-	// Add error handler to proxy
+	// Add timeout context
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+	r = r.WithContext(ctx)
+
+	// Restore body for proxy
+	if len(bodyBytes) > 0 {
+		r.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
+	}
+
 	proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
 		log.Printf("Proxy error: %v", err)
 		http.Error(w, "Bad Gateway", http.StatusBadGateway)
 	}
 
-	// Modify request to include proper path
+	// Modify request path
 	originalPath := r.URL.Path
-	log.Printf("Original request path: %s", originalPath)
-
-	// Remove /api prefix for backend
 	if strings.HasPrefix(originalPath, "/api") {
 		r.URL.Path = strings.TrimPrefix(originalPath, "/api")
-		log.Printf("Modified request path: %s", r.URL.Path)
 	}
 
-	// Capture response for logging
+	// Capture response for logging and caching
 	recorder := &responseRecorder{
 		ResponseWriter: w,
 		statusCode:     http.StatusOK,
 		body:           &bytes.Buffer{},
 	}
 
-	log.Printf("Proxying request to: %s%s", backendURL.String(), r.URL.Path)
-
 	// Proxy the request
 	proxy.ServeHTTP(recorder, r)
 
-	log.Printf("Response status: %d", recorder.statusCode)
-
-	// Log the request
-	elapsed := time.Since(startTime)
-	accessLog := &models.AccessLog{
-		TenantID:       tenant.ID,
-		Endpoint:       originalPath,
-		Method:         r.Method,
-		StatusCode:     recorder.statusCode,
-		ResponseTimeMs: int(elapsed.Milliseconds()),
-		RequestSize:    r.ContentLength,
-		ResponseSize:   int64(recorder.size),
+	// Cache successful LLM responses
+	if h.isLLMRequest(r) && recorder.statusCode == http.StatusOK && len(bodyBytes) > 0 {
+		prompt := h.extractPromptFromBody(bodyBytes)
+		if prompt != "" && recorder.body.Len() > 0 {
+			go func() {
+				ctx := context.Background()
+				err := h.semanticCache.StoreCachedResponse(ctx, tenant.ID, prompt, recorder.body.String())
+				if err != nil {
+					log.Printf("Failed to cache response: %v", err)
+				} else {
+					log.Printf("✅ Response cached for tenant %d", tenant.ID)
+				}
+			}()
+		}
 	}
 
-	go h.db.LogAccess(r.Context(), accessLog)
+	// Log access
+	elapsed := time.Since(startTime)
+	h.logAccess(r.Context(), tenant.ID, originalPath, r.Method, recorder.statusCode, elapsed, r.ContentLength, int64(recorder.size))
 
 	log.Printf("Request completed in %dms", elapsed.Milliseconds())
 }
 
-// Check if the request is to an LLM endpoint
 func (h *Handler) isLLMRequest(r *http.Request) bool {
-	// Check if path contains common LLM endpoints
-	llmPaths := []string{"/v1/chat/completions", "/v1/completions", "/api/chat", "/llm"}
+	llmPaths := []string{"/v1/chat/completions", "/v1/completions", "/api/chat", "/llm", "/generate"}
 	for _, path := range llmPaths {
 		if strings.Contains(r.URL.Path, path) {
 			return true
@@ -142,68 +174,12 @@ func (h *Handler) isLLMRequest(r *http.Request) bool {
 	return false
 }
 
-// Try to get response from semantic cache
-func (h *Handler) trySemanticCache(w http.ResponseWriter, r *http.Request, tenantID int) (string, bool) {
-	// Read request body to extract prompt
-	bodyBytes, err := io.ReadAll(r.Body)
-	if err != nil {
-		return "", false
-	}
-
-	// Restore body for potential proxy use
-	r.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
-
-	// Parse request to get prompt
+func (h *Handler) extractPromptFromBody(bodyBytes []byte) string {
 	var reqBody map[string]interface{}
 	if err := json.Unmarshal(bodyBytes, &reqBody); err != nil {
-		return "", false
+		return ""
 	}
 
-	// Extract prompt (format varies by API)
-	prompt := extractPrompt(reqBody)
-	if prompt == "" {
-		return "", false
-	}
-
-	// Check cache
-	cachedResponse, hit, err := h.semanticCache.GetCachedResponse(r.Context(), tenantID, prompt)
-	if err != nil || !hit {
-		return "", false
-	}
-
-	// Write cached response
-	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("X-Cache", "HIT")
-	w.WriteHeader(http.StatusOK)
-	w.Write([]byte(cachedResponse))
-
-	return cachedResponse, true
-}
-
-// Cache the LLM response
-func (h *Handler) cacheResponse(r *http.Request, tenantID int, responseBody []byte) {
-	// Read original request body
-	bodyBytes, err := io.ReadAll(r.Body)
-	if err != nil {
-		return
-	}
-
-	var reqBody map[string]interface{}
-	if err := json.Unmarshal(bodyBytes, &reqBody); err != nil {
-		return
-	}
-
-	prompt := extractPrompt(reqBody)
-	if prompt == "" {
-		return
-	}
-
-	// Store in cache
-	h.semanticCache.StoreCachedResponse(r.Context(), tenantID, prompt, string(responseBody))
-}
-
-// Extract prompt from various LLM API formats
-func extractPrompt(reqBody map[string]interface{}) string {
 	// OpenAI format
 	if messages, ok := reqBody["messages"].([]interface{}); ok && len(messages) > 0 {
 		if lastMsg, ok := messages[len(messages)-1].(map[string]interface{}); ok {
@@ -226,6 +202,19 @@ func extractPrompt(reqBody map[string]interface{}) string {
 	return ""
 }
 
+func (h *Handler) logAccess(ctx context.Context, tenantID int, endpoint, method string, statusCode int, elapsed time.Duration, reqSize, respSize int64) {
+	accessLog := &models.AccessLog{
+		TenantID:       tenantID,
+		Endpoint:       endpoint,
+		Method:         method,
+		StatusCode:     statusCode,
+		ResponseTimeMs: int(elapsed.Milliseconds()),
+		RequestSize:    reqSize,
+		ResponseSize:   respSize,
+	}
+	go h.db.LogAccess(ctx, accessLog)
+}
+
 type responseRecorder struct {
 	http.ResponseWriter
 	statusCode int
@@ -241,11 +230,8 @@ func (r *responseRecorder) WriteHeader(statusCode int) {
 func (r *responseRecorder) Write(b []byte) (int, error) {
 	size, err := r.ResponseWriter.Write(b)
 	r.size += size
-
-	// Also write to buffer for caching
 	if r.body != nil {
 		r.body.Write(b)
 	}
-
 	return size, err
 }
