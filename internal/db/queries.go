@@ -2,6 +2,7 @@ package db
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/HanTheDev/multi-tenant-api-gateway/internal/models"
@@ -253,22 +254,22 @@ func (db *DB) GetTenantAnalytics(ctx context.Context, tenantID int, from, to str
 		from = time.Now().AddDate(0, 0, -7).Format("2006-01-02")
 	}
 	if to == "" {
-		to = time.Now().Format("2006-01-02")
+		to = time.Now().AddDate(0, 0, 1).Format("2006-01-02") // Add 1 day to include today
 	}
 
 	// Get request count and average response time
 	statsQuery := `
         SELECT 
-            COUNT(*) as total_requests,
-            AVG(response_time_ms) as avg_response_time,
-            SUM(request_size) as total_request_size,
-            SUM(response_size) as total_response_size,
-            COUNT(CASE WHEN status_code >= 200 AND status_code < 300 THEN 1 END) as success_count,
-            COUNT(CASE WHEN status_code >= 400 THEN 1 END) as error_count
+            COALESCE(COUNT(*), 0) as total_requests,
+            COALESCE(AVG(response_time_ms), 0) as avg_response_time,
+            COALESCE(SUM(request_size), 0) as total_request_size,
+            COALESCE(SUM(response_size), 0) as total_response_size,
+            COALESCE(COUNT(CASE WHEN status_code >= 200 AND status_code < 300 THEN 1 END), 0) as success_count,
+            COALESCE(COUNT(CASE WHEN status_code >= 400 THEN 1 END), 0) as error_count
         FROM access_logs
         WHERE tenant_id = $1 
-        AND timestamp >= $2::timestamp 
-        AND timestamp <= $3::timestamp
+        AND timestamp >= $2::date 
+        AND timestamp < $3::date
     `
 
 	var stats struct {
@@ -289,7 +290,7 @@ func (db *DB) GetTenantAnalytics(ctx context.Context, tenantID int, from, to str
 		&stats.ErrorCount,
 	)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to query analytics: %w", err)
 	}
 
 	// Get top endpoints
@@ -297,8 +298,8 @@ func (db *DB) GetTenantAnalytics(ctx context.Context, tenantID int, from, to str
         SELECT endpoint, COUNT(*) as count
         FROM access_logs
         WHERE tenant_id = $1 
-        AND timestamp >= $2::timestamp 
-        AND timestamp <= $3::timestamp
+        AND timestamp >= $2::date 
+        AND timestamp < $3::date
         GROUP BY endpoint
         ORDER BY count DESC
         LIMIT 10
@@ -306,7 +307,7 @@ func (db *DB) GetTenantAnalytics(ctx context.Context, tenantID int, from, to str
 
 	rows, err := db.Pool.Query(ctx, endpointsQuery, tenantID, from, to)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to query top endpoints: %w", err)
 	}
 	defer rows.Close()
 
@@ -323,6 +324,11 @@ func (db *DB) GetTenantAnalytics(ctx context.Context, tenantID int, from, to str
 		})
 	}
 
+	successRate := 0.0
+	if stats.TotalRequests > 0 {
+		successRate = float64(stats.SuccessCount) / float64(stats.TotalRequests) * 100
+	}
+
 	return map[string]interface{}{
 		"total_requests":       stats.TotalRequests,
 		"avg_response_time_ms": stats.AvgResponseTime,
@@ -330,7 +336,7 @@ func (db *DB) GetTenantAnalytics(ctx context.Context, tenantID int, from, to str
 		"total_response_size":  stats.TotalResponseSize,
 		"success_count":        stats.SuccessCount,
 		"error_count":          stats.ErrorCount,
-		"success_rate":         float64(stats.SuccessCount) / float64(stats.TotalRequests) * 100,
+		"success_rate":         successRate,
 		"top_endpoints":        topEndpoints,
 		"time_range": map[string]string{
 			"from": from,
