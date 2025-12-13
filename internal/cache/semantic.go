@@ -7,8 +7,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"math"
 	"net/http"
+	"time"
 
 	"github.com/HanTheDev/multi-tenant-api-gateway/internal/db"
 	"github.com/HanTheDev/multi-tenant-api-gateway/internal/models"
@@ -49,13 +51,15 @@ func (sc *SemanticCache) GetCachedResponse(ctx context.Context, tenantID int, pr
 	// 1. Try exact match first (fastest)
 	cached, err := sc.db.GetCachedResponse(ctx, tenantID, promptHash)
 	if err == nil {
+		log.Printf("✅ Exact hash match found!")
 		return cached.Response, true, nil
 	}
 
-	// 2. Try semantic search
+	// 2. Try semantic search (only if embedding service is available)
 	queryEmbedding, err := sc.getEmbedding(prompt)
 	if err != nil {
-		return "", false, fmt.Errorf("failed to get embedding: %w", err)
+		log.Printf("⚠️  Embedding service unavailable: %v", err)
+		return "", false, nil // Not an error, just skip semantic search
 	}
 
 	// Get all cached prompts for this tenant from Redis
@@ -139,24 +143,40 @@ func (sc *SemanticCache) StoreCachedResponse(ctx context.Context, tenantID int, 
 func (sc *SemanticCache) getEmbedding(text string) ([]float64, error) {
 	reqBody, _ := json.Marshal(map[string]string{"text": text})
 
-	resp, err := http.Post(
+	// Add timeout for embedding service
+	client := &http.Client{
+		Timeout: 5 * time.Second,
+	}
+
+	resp, err := client.Post(
 		sc.embeddingService+"/embed",
 		"application/json",
 		bytes.NewBuffer(reqBody),
 	)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("embedding service request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
-	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("embedding service returned status %d", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read embedding response: %w", err)
+	}
 
 	var result struct {
 		Embedding []float64 `json:"embedding"`
 	}
 
 	if err := json.Unmarshal(body, &result); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to parse embedding response: %w", err)
+	}
+
+	if len(result.Embedding) == 0 {
+		return nil, fmt.Errorf("empty embedding returned")
 	}
 
 	return result.Embedding, nil
